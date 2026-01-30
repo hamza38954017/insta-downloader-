@@ -3,7 +3,6 @@ import yt_dlp
 import requests
 
 app = Flask(__name__)
-
 # --- THE WEBSITE DESIGN (HTML/CSS/JS) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
