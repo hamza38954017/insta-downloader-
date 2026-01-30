@@ -1,198 +1,213 @@
-import logging
+from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context
+import yt_dlp
 import requests
-import threading
-import os
-from flask import Flask
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from appwrite.client import Client
-from appwrite.services.databases import Databases
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ------------------------------------------------------------------
-# ⚙️ CONFIGURATION
-# ------------------------------------------------------------------
-# ⚠️ PASTE YOUR TELEGRAM BOT TOKEN BELOW
-TELEGRAM_BOT_TOKEN = "8551885799:AAG1iqE8ObrqwETtjuYJhdw430TNoPGtqnc"
-
-# Appwrite Config
-APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
-APPWRITE_PROJECT_ID = "697814dc00318b052e40"
-APPWRITE_API_KEY = "standard_d568cc436f162ea258544b826d81f125ee5439fef59bb25bd975d0ccb06e696cf35afe619bb747290151129a1001162a2aa7447ae9d681b03321e072d987b442a8637628d034a90512ad9e9c4354ccaf7d4382a7a094cf8018f517917a76c46c629ddab6958a830e5bbf8d689e09b7dc8bda484ff06f55cdcc57d7ce4c4d6a98"
-APPWRITE_DB_ID = "69781519001bb396e648"
-APPWRITE_COLLECTION_ID = "scrap"
-
-# API Config
-# UPDATED API URL
-API_URL = "https://api.paanel.shop/numapi.php"
-API_KEY = "num_wanted"
-
-# Owner Config
-OWNER_TAG = "@Hamza3895"
-
-# ------------------------------------------------------------------
-# 🌐 DUMMY WEB SERVER (FOR RENDER DEPLOYMENT)
-# ------------------------------------------------------------------
 app = Flask(__name__)
 
-@app.route('/')
-def health_check():
-    return "Bot is Alive!"
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-# ------------------------------------------------------------------
-# 🔌 SETUP
-# ------------------------------------------------------------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-client = Client()
-client.set_endpoint(APPWRITE_ENDPOINT)
-client.set_project(APPWRITE_PROJECT_ID)
-client.set_key(APPWRITE_API_KEY)
-databases = Databases(client)
-
-session = requests.Session()
-retry_strategy = Retry(
-    total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-
-# ------------------------------------------------------------------
-# 🛠 HELPER FUNCTIONS
-# ------------------------------------------------------------------
-
-def fetch_data(mobile_number):
-    try:
-        # Params construct the full URL: ...php?action=api&key=num_wanted&number=...
-        params = {"action": "api", "key": API_KEY, "number": mobile_number}
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36"}
-        response = session.get(API_URL, params=params, headers=headers, timeout=20)
-        try:
-            data = response.json()
-        except:
-            return []
-        
-        # New API returns a list directly, this handles it perfectly
-        if isinstance(data, list): return data
-        elif isinstance(data, dict):
-            if data.get('error') or data.get('response') == 'error': return []
-            return [data]
-        return []
-    except Exception as e:
-        logging.error(f"API Fetch Error: {e}")
-        return []
-
-def save_to_appwrite(data_dict, doc_id):
-    try:
-        databases.create_document(APPWRITE_DB_ID, APPWRITE_COLLECTION_ID, doc_id, data_dict)
-        return "success"
-    except Exception as e:
-        if "409" in str(e): return "duplicate"
-        logging.error(f"Appwrite DB Error: {e}")
-        return "error"
-
-# ------------------------------------------------------------------
-# 🤖 BOT HANDLERS
-# ------------------------------------------------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        f"👋 **Welcome to Nightmare for Strangers Bot!**\n\n"
-        f"🔎 **How to Use:**\n"
-        f"Send `/num` followed by the mobile number.\n"
-        f"Example: `/num 9876543210`\n\n"
-        f"👨‍💻 **Developer:** {OWNER_TAG}\n"
-        f"🆘 **Help/Contact:** {OWNER_TAG}"
-    )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
-
-async def search_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(f"⚠️ **Usage Error**\nPlease send: `/num 9876543210`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    searched_number = context.args[0]
-    status_msg = await update.message.reply_text(f"🔍 **Searching:** `{searched_number}` ...", parse_mode=ParseMode.MARKDOWN)
-    
-    results = fetch_data(searched_number)
-    
-    if not results:
-        await status_msg.edit_text("❌ **No data found.**")
-        return
-
-    response_text = f"📂 **Results for {searched_number}:**\n\n"
-    has_valid_data = False
-
-    for p in results:
-        raw_name = p.get("name")
-        # Strict N/A Check
-        if not raw_name or str(raw_name).strip() in ["", "N/A", "null", "None"]: 
-            continue
-        
-        has_valid_data = True
-        result_mobile = str(p.get("mobile", searched_number))
-        
-        # New API uses "!" in address, this replace logic handles it correctly
-        clean_address = str(p.get("address", "N/A")).replace("!", ", ").replace(" ,", ",").strip()[:250]
-
-        record = {
-            'name': str(raw_name),
-            'fname': str(p.get("father_name", "N/A")),
-            'mobile': result_mobile,
-            'address': clean_address
+# --- THE WEBSITE DESIGN (HTML/CSS/JS) ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InstaGlow Mobile</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        @keyframes gradient-xy {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
         }
+        .animate-gradient {
+            background-size: 200% 200%;
+            animation: gradient-xy 6s ease infinite;
+        }
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            -webkit-backdrop-filter: blur(16px);
+        }
+    </style>
+</head>
+<body class="bg-black text-white min-h-screen flex flex-col items-center justify-center relative overflow-hidden font-sans">
 
-        # Database Save
-        status = save_to_appwrite(record, result_mobile)
+    <div class="absolute top-0 left-0 w-full h-full bg-gradient-to-br from-gray-900 via-black to-gray-900 z-0"></div>
+    <div class="absolute top-[-50px] left-[-50px] w-64 h-64 bg-purple-600 rounded-full mix-blend-screen filter blur-3xl opacity-20 animate-pulse"></div>
+    <div class="absolute bottom-[-50px] right-[-50px] w-64 h-64 bg-pink-600 rounded-full mix-blend-screen filter blur-3xl opacity-20 animate-pulse"></div>
+
+    <div class="glass relative z-10 w-full max-w-lg p-6 md:p-10 m-4 rounded-3xl shadow-2xl border-t border-gray-700">
         
-        # Status Icon Logic
-        if status == "success": db_status = "✅ Saved"
-        elif status == "duplicate": db_status = "🔁 Exists"
-        else: db_status = "⚠️ Error"
+        <div class="text-center mb-8">
+            <h1 class="text-5xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-pink-500 via-purple-500 to-indigo-500 mb-2">
+                InstaFlow
+            </h1>
+            <p class="text-gray-400 text-sm">High Quality Video Downloader</p>
+        </div>
 
-        # Build Card
-        response_text += (
-            f"📱 **Mobile:** `{record['mobile']}`\n"
-            f"👤 **Name:** `{record['name']}`\n"
-            f"👴 **Father:** {record['fname']}\n"
-            f"🏠 **Address:** {record['address']}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+        <div class="relative group mb-6">
+            <div class="absolute -inset-0.5 bg-gradient-to-r from-pink-600 to-purple-600 rounded-xl blur opacity-30 group-hover:opacity-75 transition duration-1000 group-hover:duration-200"></div>
+            <div class="relative flex items-center bg-gray-900 rounded-xl leading-none">
+                <input type="text" id="urlInput" placeholder="Paste Instagram Link Here..." 
+                    class="w-full p-4 bg-transparent text-gray-200 placeholder-gray-600 focus:outline-none text-base">
+                <button onclick="fetchInfo()" class="pr-4 pl-2 text-purple-400 hover:text-white transition-colors">
+                    <i class="fas fa-arrow-right text-xl"></i>
+                </button>
+            </div>
+        </div>
+
+        <div id="loader" class="hidden flex flex-col items-center justify-center my-8 space-y-2">
+            <div class="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-purple-500"></div>
+            <span class="text-xs text-purple-400 animate-pulse">Fetching video info...</span>
+        </div>
+
+        <div id="resultArea" class="hidden transform transition-all duration-500 ease-out translate-y-4 opacity-0">
+            <div class="bg-gray-800/50 rounded-2xl overflow-hidden shadow-xl border border-gray-700/50">
+                <div class="relative aspect-video bg-black">
+                    <img id="thumb" src="" alt="Thumbnail" class="w-full h-full object-contain opacity-90">
+                    <div class="absolute bottom-2 right-2 bg-black/70 px-2 py-1 rounded text-xs text-white font-mono">
+                        HD
+                    </div>
+                </div>
+                
+                <div class="p-4">
+                    <h3 id="vidTitle" class="text-sm font-medium text-gray-300 line-clamp-1 mb-4"></h3>
+                    
+                    <a id="downloadBtn" href="#" 
+                        class="flex items-center justify-center w-full py-3.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-900/20 transition-all active:scale-95">
+                        <i class="fas fa-download mr-2"></i> Download Video
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div id="errorMsg" class="hidden mt-4 p-3 bg-red-900/20 border border-red-500/30 rounded-lg text-center">
+            <p class="text-red-400 text-sm flex items-center justify-center gap-2">
+                <i class="fas fa-exclamation-circle"></i> <span id="errorText">Error</span>
+            </p>
+        </div>
+
+        <div class="mt-8 text-center">
+            <p class="text-xs text-gray-600">Free service running on Render</p>
+        </div>
+
+    </div>
+
+    <script>
+        async function fetchInfo() {
+            const url = document.getElementById('urlInput').value.trim();
+            const loader = document.getElementById('loader');
+            const resultArea = document.getElementById('resultArea');
+            const errorMsg = document.getElementById('errorMsg');
+            const resultDiv = document.getElementById('resultArea');
+
+            if (!url) return;
+
+            // Reset UI
+            resultDiv.classList.add('hidden', 'opacity-0', 'translate-y-4');
+            resultDiv.classList.remove('opacity-100', 'translate-y-0');
+            errorMsg.classList.add('hidden');
+            loader.classList.remove('hidden');
+
+            try {
+                const response = await fetch('/get-info', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                });
+                
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    document.getElementById('thumb').src = data.thumbnail;
+                    document.getElementById('vidTitle').innerText = data.title;
+                    
+                    // Construct download link
+                    const cleanTitle = (data.title || 'video').replace(/[^a-zA-Z0-9]/g, "_").substring(0, 50);
+                    const downloadLink = `/download?url=${encodeURIComponent(data.direct_url)}&title=${cleanTitle}`;
+                    document.getElementById('downloadBtn').href = downloadLink;
+
+                    // Show result with animation
+                    loader.classList.add('hidden');
+                    resultDiv.classList.remove('hidden');
+                    // Small delay to allow display:block to apply before animating opacity
+                    setTimeout(() => {
+                        resultDiv.classList.remove('opacity-0', 'translate-y-4');
+                        resultDiv.classList.add('opacity-100', 'translate-y-0');
+                    }, 50);
+
+                } else {
+                    throw new Error(data.message || "Invalid Link");
+                }
+            } catch (e) {
+                loader.classList.add('hidden');
+                document.getElementById('errorText').innerText = "Failed: Check link or try again.";
+                errorMsg.classList.remove('hidden');
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+# --- BACKEND LOGIC ---
+
+def get_video_info(url):
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best',
+        # User-Agent is important for Instagram
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'status': 'success',
+                'title': info.get('title', 'Instagram Video'),
+                'thumbnail': info.get('thumbnail'),
+                'direct_url': info.get('url'),
+            }
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
+@app.route('/')
+def home():
+    # Renders the HTML string defined above
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/get-info', methods=['POST'])
+def get_info():
+    data = request.json
+    url = data.get('url')
+    if not url:
+        return jsonify({'status': 'error', 'message': 'No URL provided'})
+    
+    info = get_video_info(url)
+    return jsonify(info)
+
+@app.route('/download')
+def download_video():
+    video_url = request.args.get('url')
+    title = request.args.get('title', 'insta_video')
+    
+    if not video_url:
+        return "Error: Link missing", 400
+
+    # Stream the file to avoid storage issues on Render
+    try:
+        req = requests.get(video_url, stream=True)
+        return Response(
+            stream_with_context(req.iter_content(chunk_size=1024)),
+            content_type=req.headers.get('content-type', 'video/mp4'),
+            headers={
+                'Content-Disposition': f'attachment; filename="{title}.mp4"'
+            }
         )
-
-    # Footer
-    response_text += f"\n🤖 **Bot by {OWNER_TAG}**"
-
-    if has_valid_data:
-        if len(response_text) > 4000: response_text = response_text[:4000] + "\n...(truncated)"
-        await status_msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await status_msg.edit_text("❌ **No data found.**")
-
-# ------------------------------------------------------------------
-# ▶️ MAIN EXECUTION
-# ------------------------------------------------------------------
+    except Exception as e:
+        return f"Download failed: {str(e)}", 500
 
 if __name__ == '__main__':
-    if "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN:
-        print("❌ ERROR: Please paste your Telegram Bot Token in line 18!")
-        exit()
-
-    # 1. Start Web Server (For Render)
-    print("🌍 Starting Web Server...")
-    threading.Thread(target=run_web_server).start()
-
-    # 2. Start Bot
-    print("🔥 Bot Started...")
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("num", search_num))
-    application.run_polling()
+    app.run(host='0.0.0.0', port=5000)
