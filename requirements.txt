@@ -1,4 +1,4 @@
-python-telegram-bot==21.9
-flask
-appwrite
+Flask
+yt-dlp
 requests
+gunicorn
